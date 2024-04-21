@@ -1,6 +1,6 @@
 {
     "name": "com.matusson.beetrace",
-    "version": "0.1.0",
+    "version": "1.0.0",
     "displayName": "BeeTrace",
     "description": "Custom path tracer using Unity's RTShaders, for offline rendering. Requires DX12.",
     "unity": "2022.3",
