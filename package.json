@@ -1,0 +1,25 @@
+{
+    "name": "com.matusson.beetrace",
+    "version": "0.1.0",
+    "displayName": "BeeTrace",
+    "description": "Custom path tracer using Unity's RTShaders, for offline rendering. Requires DX12.",
+    "unity": "2022.3",
+
+    "dependencies": {
+      "com.unity.mathematics" : "1.2.0"
+    },
+
+   "keywords": [
+      "dxr",
+      "raytracing",
+      "pathtracing",
+      "tracing",
+      "render"
+    ],
+    "author": {
+      "name": "Matusson",
+      "email": "matusson.6105@gmail.com",
+      "url": "https://github.com/Matusson"
+    }
+}
+  

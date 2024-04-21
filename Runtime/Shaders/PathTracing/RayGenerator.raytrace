@@ -1,0 +1,230 @@
+#include "Core/PTData.cginc"
+#include "Core/PTUtils.cginc"
+#include "Core/PTGlobals.cginc"
+
+#include "Helper/PTDOF.cginc"
+#include "Helper/PTLights.cginc"
+
+#pragma max_recursion_depth 1
+
+// Environment data
+TextureCube<float4> environmentTexture;
+sampler sampler_environmentTexture;
+float4 environmentColor;
+float environmentIntensity;
+bool useEnvironmentTexture;
+
+// Light data
+StructuredBuffer<CamData> camdata;
+StructuredBuffer<PointLightData> pointLights;
+int pointLightCount;
+StructuredBuffer<SpotLightData> spotLights;
+int spotLightCount;
+
+
+// Volumetric rendering params
+int maxMarchingSamples;
+float minStepSize;
+
+// Other rendering params
+uint curSample;
+uint samplesPerBatch;
+int randomSeedOffset;
+float filterSize;
+float radianceClamp;
+
+// Main textures
+RWTexture2D<float4> Accumulation;
+RWTexture2D<float> SampleCount;
+RWTexture2D<float4> Result;
+
+// Denoising textures
+RWTexture2D<float4> AlbedoBuf;
+RWTexture2D<float4> NormalBuf;
+
+AppendStructuredBuffer<DebugRay> _Rays;
+bool debugRays;
+
+
+
+RayDesc ScreenPositionToRay(in float2 dispatchPosition, in float2 dispatchDimensions, in CamData cam)
+{
+    float3 origin = cam.origin;
+    float4x4 cameraToWorld = cam.cameraToWorldMatrix;
+    float4x4 cameraProjectionInverse = cam.projectionMatrixInverse;
+
+    dispatchPosition = float2(dispatchPosition.x, dispatchDimensions.y - dispatchPosition.y);
+
+    float4 clipSpace = float4(((dispatchPosition.x * 2.0f) / dispatchDimensions.x) - 1.0f, (1.0f - (2.0f * dispatchPosition.y) / dispatchDimensions.y), 0.0f, 1.0f);
+
+    float4 viewSpace = mul(cameraProjectionInverse, clipSpace);
+    viewSpace /= viewSpace.w;
+
+    float4 worldSpace = mul(cameraToWorld, viewSpace);
+    float3 worldDirection = normalize(worldSpace.xyz - origin);
+
+    RayDesc ray;
+    ray.Origin = origin;
+    ray.Direction = worldDirection;
+    ray.TMin = 0.00001;
+    ray.TMax = g_maxRayT;
+    return ray;
+}
+
+
+void IntegrateRay(inout RayDesc ray, inout RayPayload hit, inout uint rngState, inout float3 radiance, in uint2 debugId)
+{
+    float3 throughput = float3(1, 1, 1);
+    uint missShaderIndex = 0;
+
+    // In case of shader compilation error, prevent from running to infinity
+    int safety = 0;
+    while(safety < 1000)
+    {
+        TraceRay(g_rtas, 0, 0xFF, 0, 1, missShaderIndex, ray, hit);
+
+        // Trace against lights
+        float lightT;
+        for(int i = 0; i < pointLightCount; i++)
+        {
+            PointLightData light = pointLights[i];
+
+            if(RaySphereIntersection(ray, light, lightT))
+            {
+                if(lightT < hit.t)
+                {
+                    radiance += light.emission * throughput;
+                    return;
+                } 
+            }
+        }
+
+        for(int i = 0; i < spotLightCount; i++)
+        {
+            SpotLightData light = spotLights[i];
+            if(RaySpotlightIntersection(ray, light, lightT))
+            {
+                if(lightT < hit.t)
+                {
+                    radiance += light.emission * throughput;
+                    return;
+                }
+            }
+        }
+
+        float3 originalOriginDebug = ray.Origin;
+        float3 originalDirectionDebug = ray.Direction;
+
+        throughput *= hit.energyLoss;
+    
+        // Do not multiply by the hit point albedo if scattered
+        if(!hit.wasScattered)
+        {
+            radiance += hit.emission * throughput;
+            throughput *= max(hit.albedo, 0.00001);
+        }
+        float denoiseWeight = 1 / (curSample);
+
+        if(any(hit.denoisingNormal > -2) && hit.depthVolume == 0)
+        {
+            float4 prevNormalVal = NormalBuf[debugId];
+            float3 newVal = prevNormalVal * (1 - denoiseWeight) + hit.denoisingNormal * denoiseWeight;
+
+            NormalBuf[debugId] = float4(newVal, 1);
+            //radiance = NormalBuf[debugId];
+        }
+
+        if(any(hit.denoisingAlbedo > -2))
+        {
+            float4 prevAlbedoVal = AlbedoBuf[debugId];
+            float3 newVal = prevAlbedoVal * (1 - denoiseWeight) + hit.denoisingAlbedo * denoiseWeight;
+
+            AlbedoBuf[debugId] = float4(newVal, 1);
+            //radiance = hit.denoisingAlbedo;
+        }
+
+        // New direction
+        ray.Origin = hit.bounceRayOrigin;
+        ray.Direction = hit.bounceRayDirection;
+        
+        if (debugRays && debugId.x == 300 && debugId.y == 300)
+        {
+            DebugRay debgRay;
+            debgRay.Origin = float4(originalOriginDebug, 0);
+            debgRay.Direction = float4(originalDirectionDebug, 0);
+            debgRay.TargetPoint = float4(hit.bounceRayOrigin, 0);
+            debgRay.Color = float4(throughput, 1);
+            debgRay.WasScattered = hit.wasScattered;
+            debgRay.Transparency = 1;//energyLoss;
+            _Rays.Append(debgRay);
+        }
+
+        if ((hit.depthSurface == -1 || hit.depthSurface >= g_maxDepthSurface))// && !hit.wasScattered)
+            break;
+
+
+        safety++;
+    }
+}
+
+[shader("raygeneration")]
+void MyRaygenShader()
+{
+    uint2 pixelId = uint2(DispatchRaysIndex().x, DispatchRaysDimensions().y - DispatchRaysIndex().y - 1);
+    uint2 dimensions = DispatchRaysDimensions().xy;
+
+    // Initialize random state
+    uint rngState = uint(uint(pixelId.x) * uint(1973) + uint(pixelId.y) * uint(9277) + uint(randomSeedOffset) * uint(26699)) | uint(1);
+
+    for(int i = 0; i < samplesPerBatch; i++)
+    {
+        // Generate an initial ray with random jitter offset per pixel
+        CamData cam = camdata[0];
+        float2 subpixelJitter = float2(RandomFloat01(rngState), RandomFloat01(rngState)) - float2(0.5, 0.5);
+        subpixelJitter *= filterSize;
+        RayDesc ray = ScreenPositionToRay(pixelId.xy + subpixelJitter, dimensions, cam);
+
+        ApplyDof(ray, cam, rngState);
+        RayPayload hit = NewPayload(rngState);
+    
+        float3 radiance = float3(0, 0, 0);  
+        IntegrateRay(ray, hit, rngState, radiance, pixelId.xy);
+        radiance = clamp(radiance, 0, radianceClamp);
+
+        // Set result and average
+        Accumulation[pixelId.xy] += float4(radiance, 1);
+        SampleCount[pixelId.xy] += 1;
+      
+        Result[pixelId.xy] = Accumulation[pixelId.xy] / SampleCount[pixelId.xy];
+    }
+}
+
+[shader("miss")]
+void MainMissShader0(inout RayPayload payload : SV_RayPayload)
+{
+    if (useEnvironmentTexture)
+        payload.emission = environmentTexture.SampleLevel(sampler_environmentTexture, WorldRayDirection(), 0).xyz * environmentIntensity;
+    else
+        payload.emission = environmentColor.xyz * environmentIntensity;
+
+    payload.albedo = 1;
+    payload.isFrontFace = 0;
+    payload.wasScattered = false;
+
+    payload.mediumStack = 0;
+    payload.mediumStackCounter = -1;
+
+    if(payload.depthSurface == 0)
+    {
+        payload.denoisingAlbedo = 0;
+        payload.denoisingNormal = 0;
+    }
+
+    payload.depthSurface = -1;
+    payload.t = g_maxRayT;
+
+
+    // DEBUG
+    payload.bounceRayOrigin = WorldRayOrigin() + WorldRayDirection();
+
+}
